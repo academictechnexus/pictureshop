@@ -1,0 +1,1038 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FramedForever – Wedding Studio</title>
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;600;700&family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet">
+
+<!-- Firebase -->
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.0/firebase-app.js";
+import { getFirestore, collection, addDoc, updateDoc, deleteDoc, doc, onSnapshot, query, orderBy, setDoc, getDoc, serverTimestamp } from "https://www.gstatic.com/firebasejs/10.7.0/firebase-firestore.js";
+import { getAuth, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut, onAuthStateChanged, updateProfile } from "https://www.gstatic.com/firebasejs/10.7.0/firebase-auth.js";
+
+// ── PASTE YOUR FIREBASE CONFIG HERE ──────────────────────────
+const firebaseConfig = {
+  apiKey: "AIzaSyCyWFM2q7xsx9HNXb8jpZ6nkik1JXhmt-8",
+  authDomain: "pictureshopversion2.firebaseapp.com",
+  projectId: "pictureshopversion2",
+  storageBucket: "pictureshopversion2.firebasestorage.app",
+  messagingSenderId: "682047762135",
+  appId: "1:682047762135:web:d6eec286c86fb5dd80ca92"
+};
+// ─────────────────────────────────────────────────────────────
+
+const app = initializeApp(firebaseConfig);
+const db = getFirestore(app);
+const auth = getAuth(app);
+
+// ── STATE ─────────────────────────────────────────────────────
+let currentUser = null, studioProfile = null, events = [], leads = [];
+let selectedEventId = null, currentView = "dashboard", dark = false;
+let unsubEvents = null, unsubLeads = null;
+
+// ── DEFAULT WORKFLOW STAGES ───────────────────────────────────
+const DEFAULT_STAGES = [
+  { id: 0, name: "Booked",             icon: "📅", sla: null },
+  { id: 1, name: "Event Completed",    icon: "🎉", sla: 3 },
+  { id: 2, name: "Backup Created",     icon: "💾", sla: 1 },
+  { id: 3, name: "Gallery Link Sent",  icon: "🔗", sla: 2 },
+  { id: 4, name: "Awaiting Selection", icon: "👀", sla: 7 },
+  { id: 5, name: "Editing",            icon: "✏️",  sla: 5 },
+  { id: 6, name: "Final Delivered",    icon: "📬", sla: 2 },
+  { id: 7, name: "Payment Received",   icon: "💰", sla: null },
+];
+
+function getStages() {
+  return studioProfile?.customStages || DEFAULT_STAGES;
+}
+
+// ── AUTH ──────────────────────────────────────────────────────
+onAuthStateChanged(auth, async (user) => {
+  currentUser = user;
+  if (user) {
+    const snap = await getDoc(doc(db, "studios", user.uid));
+    if (snap.exists()) studioProfile = snap.data();
+    startListeners();
+    renderApp();
+  } else {
+    if (unsubEvents) unsubEvents();
+    if (unsubLeads) unsubLeads();
+    renderAuth();
+  }
+});
+
+function startListeners() {
+  if (unsubEvents) unsubEvents();
+  if (unsubLeads) unsubLeads();
+  const uid = currentUser.uid;
+  unsubEvents = onSnapshot(query(collection(db, "studios", uid, "events"), orderBy("createdAt","desc")), snap => {
+    events = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    renderApp();
+  });
+  unsubLeads = onSnapshot(query(collection(db, "studios", uid, "leads"), orderBy("createdAt","desc")), snap => {
+    leads = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    renderApp();
+  });
+}
+
+// ── HELPERS ───────────────────────────────────────────────────
+const fmtDate = d => { try { return new Date(d+"T00:00:00").toLocaleDateString("en-IN",{day:"numeric",month:"short",year:"numeric"}); } catch { return d||"—"; }};
+const fmtCur = n => new Intl.NumberFormat("en-IN",{style:"currency",currency:"INR",maximumFractionDigits:0}).format(n||0);
+const firstName = n => (n||"").split(" ")[0].split("&")[0].trim();
+const daysIn = ts => { try { return Math.floor((Date.now()-new Date(ts))/86400000); } catch { return 0; }};
+const isOverdue = ev => { const s=getStages()[ev.stage]; return s&&s.sla&&ev.stage<getStages().length-1&&daysIn(ev.stageEnteredAt)>s.sla; };
+const pct = ev => Math.round((ev.stage/(getStages().length-1))*100);
+const toast = msg => { const t=document.createElement("div"); t.className="toast"; t.textContent=msg; document.body.appendChild(t); setTimeout(()=>t.remove(),3000); };
+const $ = id => document.getElementById(id);
+const waLink = (phone,msg) => `https://wa.me/${(phone||"").replace(/\D/g,"")}?text=${encodeURIComponent(msg)}`;
+
+// ── FIRESTORE OPS ─────────────────────────────────────────────
+async function addEvent(data) {
+  const stages = getStages();
+  await addDoc(collection(db,"studios",currentUser.uid,"events"), {
+    ...data, stage:0, stageEnteredAt:new Date().toISOString(),
+    followupCount:0, amountTotal:Number(data.amountTotal)||0,
+    amountPaid:Number(data.amountPaid)||0, staff:[], checklist:{},
+    galleryLink:"", finalLink:"", notes:"",
+    log:[{ts:new Date().toISOString(),msg:"Booking created"}],
+    createdAt:serverTimestamp()
+  });
+}
+
+async function updateEvent(id, data) {
+  await updateDoc(doc(db,"studios",currentUser.uid,"events",id), data);
+}
+
+async function deleteEvent(id) {
+  await deleteDoc(doc(db,"studios",currentUser.uid,"events",id));
+}
+
+async function advanceStage(ev) {
+  const stages = getStages();
+  if (ev.stage >= stages.length-1) return;
+  const newStage = ev.stage+1;
+  const log = [...(ev.log||[]), {ts:new Date().toISOString(), msg:`Moved to: ${stages[newStage].name}`}];
+  await updateEvent(ev.id, {stage:newStage, stageEnteredAt:new Date().toISOString(), log});
+  toast(`✓ Stage → ${stages[newStage].name}`);
+}
+
+async function logAction(ev, msg) {
+  const log = [...(ev.log||[]), {ts:new Date().toISOString(), msg}];
+  await updateEvent(ev.id, {log});
+}
+
+async function saveStudioProfile(data) {
+  await setDoc(doc(db,"studios",currentUser.uid), data, {merge:true});
+  studioProfile = {...studioProfile, ...data};
+}
+
+async function addLead(data) {
+  await addDoc(collection(db,"studios",currentUser.uid,"leads"), {
+    ...data, status:"New", createdAt:serverTimestamp(),
+    log:[{ts:new Date().toISOString(),msg:"Lead created"}]
+  });
+}
+
+async function updateLead(id, data) {
+  await updateDoc(doc(db,"studios",currentUser.uid,"leads",id), data);
+}
+
+async function deleteLead(id) {
+  await deleteDoc(doc(db,"studios",currentUser.uid,"leads",id));
+}
+
+// ── MESSAGES ──────────────────────────────────────────────────
+const sName = () => studioProfile?.studioName||"FramedForever Studio";
+const msgs = {
+  bookingConfirm: ev => `Hi ${firstName(ev.client)} 😊\n\nYour booking is confirmed with ${sName()}!\n\n📅 Event: ${ev.type}\n🗓 Date: ${fmtDate(ev.date)}\n📍 Venue: ${ev.venue||"As discussed"}\n\nWe're excited to capture your special day!\n\nWarm regards,\n${sName()}`,
+  galleryLink: ev => `Hi ${firstName(ev.client)} 😊\n\nYour photos from your ${ev.type} on ${fmtDate(ev.date)} are ready!\n\n👉 ${ev.galleryLink||"[Insert Gallery Link]"}\n\nKindly browse and let us know your selections within 7 days.\n\nWarm regards,\n${sName()}`,
+  followup1: ev => `Hi ${firstName(ev.client)} 🌸\n\nJust a gentle reminder that your photo gallery is ready and waiting for your selections!\n\n👉 ${ev.galleryLink||"[Gallery Link]"}\n\nThank you 🙏\n${sName()}`,
+  followup2: ev => `Hi ${firstName(ev.client)},\n\nSecond reminder — we'd love to begin editing your photos soon! Could you please share your selections?\n\n👉 ${ev.galleryLink||"[Gallery Link]"}\n\n${sName()}`,
+  followup3: ev => `Hi ${firstName(ev.client)},\n\nFinal reminder! If we don't hear back within 2 days, we'll proceed with our professional selection.\n\n👉 ${ev.galleryLink||"[Gallery Link]"}\n\n${sName()}`,
+  finalDelivery: ev => `Hi ${firstName(ev.client)} 🎉\n\nYour edited photos are ready!\n\n👉 ${ev.finalLink||"[Final Gallery Link]"}\n\nWe hope you love every frame! ${(ev.amountTotal||0)>(ev.amountPaid||0)?`\n\nKindly process the pending payment of ${fmtCur((ev.amountTotal||0)-(ev.amountPaid||0))}.`:""}\n\nWith love,\n${sName()}`,
+  paymentReminder: ev => `Hi ${firstName(ev.client)},\n\nGentle reminder that the payment of ${fmtCur((ev.amountTotal||0)-(ev.amountPaid||0))} is pending.\n\n💳 [Insert UPI/Payment Link]\n\nThank you!\n${sName()}`,
+  reviewRequest: ev => `Hi ${firstName(ev.client)} 🌟\n\nWe hope you're loving your photos from your ${ev.type}!\n\nIf you're happy with our work, we'd be so grateful if you could leave us a Google review 🙏\n\n⭐ ${studioProfile?.googleReviewLink||"[Google Review Link]"}\n\nThank you so much!\n${sName()}`,
+};
+
+// ── RENDER AUTH ───────────────────────────────────────────────
+function renderAuth() {
+  document.body.innerHTML = `
+  <div class="auth-page">
+    <div class="auth-card">
+      <div class="auth-logo">📷</div>
+      <h1 class="auth-brand">FramedForever</h1>
+      <p class="auth-sub">Wedding Studio Management</p>
+      <div class="auth-tabs">
+        <button class="auth-tab active" onclick="showTab('login')">Sign In</button>
+        <button class="auth-tab" onclick="showTab('register')">New Studio</button>
+      </div>
+      <div id="loginForm">
+        <div class="fg"><label>EMAIL</label><input type="email" id="loginEmail" placeholder="you@studio.com"></div>
+        <div class="fg"><label>PASSWORD</label><input type="password" id="loginPass" placeholder="••••••••"></div>
+        <button class="auth-btn" onclick="doLogin()">Sign In →</button>
+      </div>
+      <div id="registerForm" style="display:none">
+        <div class="fg"><label>STUDIO NAME</label><input type="text" id="regStudio" placeholder="Golden Frame Studio"></div>
+        <div class="fg"><label>YOUR NAME</label><input type="text" id="regName" placeholder="Your name"></div>
+        <div class="fg"><label>EMAIL</label><input type="email" id="regEmail" placeholder="you@studio.com"></div>
+        <div class="fg"><label>PASSWORD</label><input type="password" id="regPass" placeholder="min 6 characters"></div>
+        <button class="auth-btn" onclick="doRegister()">Create Studio →</button>
+      </div>
+      <p id="authError" style="color:#c4715a;font-size:12px;margin-top:10px;text-align:center"></p>
+    </div>
+  </div>`;
+}
+
+window.showTab = t => {
+  $("loginForm").style.display = t==="login"?"block":"none";
+  $("registerForm").style.display = t==="register"?"block":"none";
+  document.querySelectorAll(".auth-tab").forEach((b,i)=>b.classList.toggle("active",(t==="login"&&i===0)||(t==="register"&&i===1)));
+};
+
+window.doLogin = async () => {
+  try {
+    await signInWithEmailAndPassword(auth, $("loginEmail").value, $("loginPass").value);
+  } catch(e) { $("authError").textContent = e.message.replace("Firebase: ","").replace(/ \(auth.*\)/,""); }
+};
+
+window.doRegister = async () => {
+  try {
+    const cred = await createUserWithEmailAndPassword(auth, $("regEmail").value, $("regPass").value);
+    await updateProfile(cred.user, {displayName: $("regName").value});
+    const profile = {studioName:$("regStudio").value, ownerName:$("regName").value, email:$("regEmail").value, staff:[], packages:[], customStages:DEFAULT_STAGES, createdAt:new Date().toISOString()};
+    await setDoc(doc(db,"studios",cred.user.uid), profile);
+    studioProfile = profile;
+  } catch(e) { $("authError").textContent = e.message.replace("Firebase: ","").replace(/ \(auth.*\)/,""); }
+};
+
+// ── RENDER MAIN APP ───────────────────────────────────────────
+function renderApp() {
+  const od = events.filter(isOverdue).length;
+  document.body.innerHTML = `
+  <div class="app ${dark?"dark":""}">
+    <nav class="nav">
+      <div class="nav-brand">
+        <span style="font-size:18px">📷</span>
+        <span class="nav-title">FramedForever</span>
+        <span class="nav-studio">${studioProfile?.studioName||""}</span>
+      </div>
+      <div class="nav-links">
+        ${["dashboard","events","calendar","leads","settings"].map(v=>`
+          <button class="nav-btn ${currentView===v?"active":""}" onclick="setView('${v}')">
+            ${{dashboard:"📊",events:"📋",calendar:"🗓️",leads:"🔍",settings:"⚙️"}[v]} ${v.charAt(0).toUpperCase()+v.slice(1)}
+          </button>`).join("")}
+      </div>
+      <div class="nav-right">
+        ${od>0?`<span class="od-badge" onclick="setView('events')">⚠ ${od} Overdue</span>`:""}
+        <button class="icon-btn" onclick="exportExcel()" title="Export Excel">📥</button>
+        <button class="icon-btn" onclick="toggleDark()">${dark?"☀️":"🌙"}</button>
+        <button class="icon-btn" onclick="doLogout()" title="Sign out">🚪</button>
+      </div>
+    </nav>
+    <div class="body" id="mainBody"></div>
+  </div>
+  <div class="modal-overlay" id="modalOverlay" style="display:none" onclick="if(event.target===this)closeModal()">
+    <div class="modal" id="modal"></div>
+  </div>
+  <div id="toastArea"></div>`;
+  renderView();
+}
+
+window.setView = v => { currentView=v; renderApp(); };
+window.toggleDark = () => { dark=!dark; renderApp(); };
+window.doLogout = () => signOut(auth);
+
+function renderView() {
+  const body = $("mainBody");
+  if (!body) return;
+  if (currentView==="dashboard") body.innerHTML = renderDashboard();
+  else if (currentView==="events") body.innerHTML = renderEventsLayout();
+  else if (currentView==="calendar") body.innerHTML = renderCalendar();
+  else if (currentView==="leads") body.innerHTML = renderLeads();
+  else if (currentView==="settings") body.innerHTML = renderSettings();
+  attachEventListeners();
+}
+
+// ── DASHBOARD ─────────────────────────────────────────────────
+function renderDashboard() {
+  const total=events.length, active=events.filter(e=>e.stage<getStages().length-1).length;
+  const od=events.filter(isOverdue).length, done=events.filter(e=>e.stage===getStages().length-1).length;
+  const revenue=events.reduce((s,e)=>s+(e.amountTotal||0),0);
+  const collected=events.reduce((s,e)=>s+(e.amountPaid||0),0);
+  const pending=revenue-collected;
+  const overdueList=events.filter(isOverdue).slice(0,5);
+  const pendingList=events.filter(e=>(e.amountTotal||0)>(e.amountPaid||0)).slice(0,5);
+  return `<div class="page">
+    <h2 class="heading">Good day, ${studioProfile?.ownerName?.split(" ")[0]||"there"} 👋</h2>
+    <p class="sub-text">${studioProfile?.studioName} · Overview</p>
+    <div class="kpi-grid">
+      ${kpi("📋","Total",total,"var(--gold)")}
+      ${kpi("⚡","Active",active,"var(--gold)")}
+      ${kpi("⚠️","Overdue",od,od?"#e07060":"var(--sage)")}
+      ${kpi("✅","Completed",done,"var(--sage)")}
+      ${kpi("💰","Revenue",fmtCur(revenue),"var(--sage)")}
+      ${kpi("✓","Collected",fmtCur(collected),"var(--sage)")}
+      ${kpi("⏳","Pending",fmtCur(pending),pending?"#e07060":"var(--sage)")}
+    </div>
+    <div class="two-col">
+      <div class="card">
+        <h3 class="card-title">⚠️ Needs Attention</h3>
+        ${overdueList.length===0?'<p style="color:var(--sage);font-size:13px">All on track 🎉</p>':overdueList.map(e=>`
+          <div class="list-row" onclick="selectEvent('${e.id}')">
+            <div><div style="font-weight:600;font-size:13px">${e.client}</div><div style="font-size:11px;color:var(--muted)">${getStages()[e.stage]?.name}</div></div>
+            <span style="color:#e07060;font-size:11px;font-weight:700">OVERDUE</span>
+          </div>`).join("")}
+      </div>
+      <div class="card">
+        <h3 class="card-title">💰 Pending Payments</h3>
+        ${pendingList.length===0?'<p style="color:var(--sage);font-size:13px">No pending payments 🎉</p>':pendingList.map(e=>`
+          <div class="list-row" onclick="selectEvent('${e.id}')">
+            <div><div style="font-weight:600;font-size:13px">${e.client}</div><div style="font-size:11px;color:var(--muted)">${e.type} · ${fmtDate(e.date)}</div></div>
+            <span style="color:#e07060;font-size:13px;font-weight:700">${fmtCur((e.amountTotal||0)-(e.amountPaid||0))}</span>
+          </div>`).join("")}
+      </div>
+    </div>
+    <div class="two-col">
+      <div class="card">
+        <h3 class="card-title">📊 Events by Stage</h3>
+        ${getStages().map(s=>{const c=events.filter(e=>e.stage===s.id).length;return c>0?`<div class="list-row"><span style="font-size:13px">${s.icon} ${s.name}</span><span class="badge" style="background:var(--rose-light);color:var(--rose)">${c}</span></div>`:""}).join("")}
+      </div>
+      <div class="card">
+        <h3 class="card-title">🔍 Recent Leads</h3>
+        ${leads.slice(0,5).length===0?'<p style="color:var(--muted);font-size:13px">No leads yet</p>':leads.slice(0,5).map(l=>`
+          <div class="list-row">
+            <div><div style="font-weight:600;font-size:13px">${l.name}</div><div style="font-size:11px;color:var(--muted)">${l.eventType} · ${l.source}</div></div>
+            <span class="badge" style="background:var(--sage-light);color:var(--sage)">${l.status}</span>
+          </div>`).join("")}
+      </div>
+    </div>
+  </div>`;
+}
+const kpi=(icon,label,val,color)=>`<div class="kpi-card"><div style="font-size:22px">${icon}</div><div style="font-size:18px;font-weight:700;color:${color}">${val}</div><div style="font-size:11px;color:var(--muted)">${label}</div></div>`;
+
+// ── EVENTS LAYOUT ─────────────────────────────────────────────
+function renderEventsLayout() {
+  const ev = events.find(e=>e.id===selectedEventId);
+  return `<div class="events-layout">
+    <aside class="sidebar">
+      <div style="padding:14px">
+        <button class="btn-primary w100" onclick="toggleBookingForm()">＋ New Booking</button>
+      </div>
+      <div id="bookingForm" style="display:none;padding:0 14px 14px;background:var(--bg);border-bottom:1px solid var(--border)">
+        ${bookingFormHTML()}
+        <button class="btn-primary w100" style="margin-top:8px" onclick="submitBooking()">Book Event</button>
+      </div>
+      <div style="padding:8px 14px;border-bottom:1px solid var(--border);display:flex;gap:6px;flex-wrap:wrap">
+        ${["all","active","overdue","done"].map(f=>`<button class="filter-btn ${(window._filter||'all')===f?'active':''}" onclick="setFilter('${f}')">${f==="overdue"?"⚠ Overdue":f.charAt(0).toUpperCase()+f.slice(1)}</button>`).join("")}
+      </div>
+      <div class="event-list">
+        ${filteredEvents().map(e=>`
+          <div class="event-item ${selectedEventId===e.id?"active":""}" onclick="selectEvent('${e.id}')">
+            ${isOverdue(e)?'<div class="od-dot"></div>':""}
+            <div style="font-weight:600;font-size:13px">${e.client}</div>
+            <div style="font-size:11px;color:var(--muted)">${fmtDate(e.date)} · ${e.type}</div>
+            <div class="stage-badge stage-${e.stage}">${getStages()[e.stage]?.icon} ${getStages()[e.stage]?.name}</div>
+          </div>`).join("")||'<div style="padding:20px;text-align:center;font-size:12px;color:var(--muted)">No events found</div>'}
+      </div>
+    </aside>
+    <div class="detail-panel">
+      ${ev ? renderEventDetail(ev) : '<div class="empty-state"><div style="font-size:52px;opacity:0.3">💍</div><p>Select an event to view workflow</p></div>'}
+    </div>
+  </div>`;
+}
+
+function bookingFormHTML(prefill={}) {
+  const pkgs = studioProfile?.packages||[];
+  return `
+    <div class="fg"><label>CLIENT NAME *</label><input type="text" id="bf_client" value="${prefill.client||""}" placeholder="Priya & Arjun"></div>
+    <div class="fg"><label>EVENT DATE *</label><input type="date" id="bf_date" value="${prefill.date||""}"></div>
+    <div class="fg"><label>EVENT TYPE</label><select id="bf_type">
+      ${["Wedding","Engagement","Reception","Pre-Wedding Shoot","Birthday","Baby Shower","Corporate","Other"].map(t=>`<option ${prefill.type===t?"selected":""}>${t}</option>`).join("")}
+    </select></div>
+    <div class="fg"><label>PHONE / WHATSAPP</label><input type="text" id="bf_phone" value="${prefill.phone||""}" placeholder="+91 98765 43210"></div>
+    <div class="fg"><label>EMAIL</label><input type="email" id="bf_email" value="${prefill.email||""}" placeholder="client@email.com"></div>
+    <div class="fg"><label>VENUE</label><input type="text" id="bf_venue" value="${prefill.venue||""}" placeholder="Venue name"></div>
+    ${pkgs.length>0?`<div class="fg"><label>PACKAGE</label><select id="bf_pkg" onchange="applyPackage(this.value)"><option value="">-- Select Package --</option>${pkgs.map(p=>`<option value="${p.id}">${p.name} – ${fmtCur(p.price)}</option>`).join("")}</select></div>`:""}
+    <div class="fg"><label>TOTAL AMOUNT (₹)</label><input type="number" id="bf_total" value="${prefill.amountTotal||""}" placeholder="50000"></div>
+    <div class="fg"><label>ADVANCE PAID (₹)</label><input type="number" id="bf_paid" value="${prefill.amountPaid||""}" placeholder="10000"></div>
+    <div class="fg"><label>NOTES</label><textarea id="bf_notes" placeholder="Package details...">${prefill.notes||""}</textarea></div>`;
+}
+
+window.applyPackage = id => {
+  const pkg = (studioProfile?.packages||[]).find(p=>p.id==id);
+  if (pkg) { $("bf_total").value=pkg.price; $("bf_notes").value=pkg.includes||pkg.description||""; }
+};
+
+window.toggleBookingForm = () => {
+  const f=$("bookingForm");
+  f.style.display=f.style.display==="none"?"block":"none";
+};
+
+window.submitBooking = async () => {
+  const client=$("bf_client").value.trim();
+  const date=$("bf_date").value;
+  if (!client||!date){toast("Name and date required");return;}
+  await addEvent({client,date,type:$("bf_type").value,phone:$("bf_phone").value,email:$("bf_email").value,venue:$("bf_venue").value,amountTotal:$("bf_total").value,amountPaid:$("bf_paid").value,notes:$("bf_notes").value});
+  toast(`✓ Booked: ${client}`);
+  $("bookingForm").style.display="none";
+};
+
+window.setFilter = f => { window._filter=f; renderView(); };
+window.selectEvent = id => { selectedEventId=id; currentView="events"; renderView(); };
+
+function filteredEvents() {
+  const f=window._filter||"all";
+  return events.filter(e=>{
+    if(f==="active") return e.stage<getStages().length-1;
+    if(f==="overdue") return isOverdue(e);
+    if(f==="done") return e.stage===getStages().length-1;
+    return true;
+  });
+}
+
+// ── EVENT DETAIL ──────────────────────────────────────────────
+function renderEventDetail(ev) {
+  const stages=getStages();
+  const due=(ev.amountTotal||0)-(ev.amountPaid||0);
+  const od=isOverdue(ev);
+  const checklist=ev.checklist||{};
+  const checkItems=["RAW files imported","Backup HDD 1","Backup HDD 2 / Cloud","Photo culling","Color grading","Reels exported","Gallery uploaded","Client selections received","Final editing","Watermarks removed","Final export & naming","Final gallery sent","Invoice sent","Payment received","Project archived"];
+  const doneCheck=checkItems.filter((_,i)=>checklist[i]).length;
+
+  return `<div class="page" style="max-width:100%">
+    <div class="detail-header">
+      <div>
+        <h2 class="heading" style="margin-bottom:4px">${ev.client}</h2>
+        <div style="font-size:12px;color:var(--muted);display:flex;gap:12px;flex-wrap:wrap">
+          <span>📅 ${fmtDate(ev.date)}</span><span>🎬 ${ev.type}</span>
+          ${ev.venue?`<span>📍 ${ev.venue}</span>`:""}
+          ${ev.phone?`<span>📱 ${ev.phone}</span>`:""}
+        </div>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn-outline" onclick="openEditEvent('${ev.id}')">✏️ Edit</button>
+        <button class="btn-outline" style="color:var(--gold)" onclick="generateInvoice('${ev.id}')">🧾 Invoice</button>
+        ${ev.stage>=stages.length-2?`<button class="btn-outline" style="color:var(--sage)" onclick="showMsgModal('${ev.id}','reviewRequest')">⭐ Review</button>`:""}
+        <button class="btn-outline" style="color:var(--rose)" onclick="confirmDelete('${ev.id}')">🗑</button>
+      </div>
+    </div>
+
+    <div style="margin-bottom:16px">
+      <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--muted);margin-bottom:5px"><span>Progress</span><span>${pct(ev)}%</span></div>
+      <div class="prog-bar"><div class="prog-fill" style="width:${pct(ev)}%"></div></div>
+    </div>
+
+    <div class="info-grid">
+      <div class="info-card"><div class="info-label">Package Value</div><div class="info-val">${fmtCur(ev.amountTotal)}</div></div>
+      <div class="info-card"><div class="info-label">Paid</div><div class="info-val" style="color:var(--sage)">${fmtCur(ev.amountPaid)}</div></div>
+      <div class="info-card"><div class="info-label">Due</div><div class="info-val" style="color:${due>0?"#e07060":"var(--sage)"}">${fmtCur(due)}</div></div>
+      <div class="info-card"><div class="info-label">Staff</div><div class="info-val" style="font-size:12px">${(ev.staff||[]).join(", ")||"—"}</div></div>
+    </div>
+
+    ${ev.galleryLink||ev.finalLink?`<div style="display:flex;gap:8px;margin-bottom:18px;flex-wrap:wrap">
+      ${ev.galleryLink?`<a href="${ev.galleryLink}" target="_blank" class="link-btn">🔗 Gallery</a>`:""}
+      ${ev.finalLink?`<a href="${ev.finalLink}" target="_blank" class="link-btn" style="background:var(--sage-light);color:var(--sage)">📬 Final Link</a>`:""}
+    </div>`:""}
+
+    <h3 class="section-title">Workflow</h3>
+    <div class="timeline">
+      ${stages.map((stage,i)=>{
+        const done=i<ev.stage, active=i===ev.stage;
+        const dayCount=active?daysIn(ev.stageEnteredAt):0;
+        const stageOd=active&&od;
+        return `<div class="tl-row">
+          <div class="tl-dot-wrap">
+            <div class="tl-dot ${done?"done":active?"active":""}">${done?"✓":active?"●":""}</div>
+            ${i<stages.length-1?`<div class="tl-line ${done?"done":""}"></div>`:""}
+          </div>
+          <div class="step-card ${active?"active":done?"done":""}">
+            <div class="step-head">
+              <span class="step-name">${stage.icon} ${stage.name}</span>
+              ${active&&stage.sla?`<span class="sla-tag ${stageOd?"od":""}">Day ${dayCount} of ${stage.sla}${stageOd?" — OVERDUE":""}</span>`:""}
+              ${done?'<span style="font-size:11px;color:var(--sage);font-weight:600">✓ Done</span>':""}
+            </div>
+            ${active?`<div class="step-actions">
+              ${i===0?`<button class="btn-msg" onclick="showMsgModal('${ev.id}','bookingConfirm')">📤 Booking Confirmation</button>`:""}
+              ${i===3?`<button class="btn-msg" onclick="showMsgModal('${ev.id}','galleryLink')">🔗 Send Gallery Link</button>`:""}
+              ${i===4?`<div style="font-size:12px;color:var(--muted);margin-bottom:6px">Follow-ups sent: <b>${ev.followupCount||0}/3</b></div>
+                ${(ev.followupCount||0)<3?`<button class="btn-msg" onclick="sendFollowup('${ev.id}')">📨 Follow-up ${(ev.followupCount||0)+1}</button>`:
+                `<button class="btn-gold" onclick="autoSelect('${ev.id}')">⚡ Auto-Select & Continue</button>`}`:""}
+              ${i===stages.length-2?`<button class="btn-msg" onclick="showMsgModal('${ev.id}','finalDelivery')">📬 Final Delivery</button>`:""}
+              ${i===stages.length-1&&due>0?`<button class="btn-msg" onclick="showMsgModal('${ev.id}','paymentReminder')">💳 Payment Reminder</button>`:""}
+              ${i<stages.length-1?`<button class="btn-next" onclick="doAdvance('${ev.id}')">→ Mark Done & Next</button>`:""}
+              ${i===stages.length-1?'<span style="color:var(--sage);font-size:13px;font-weight:600">🎉 Complete!</span>':""}
+            </div>`:""}
+          </div>
+        </div>`;
+      }).join("")}
+    </div>
+
+    <h3 class="section-title">📁 File Checklist (${doneCheck}/${checkItems.length})</h3>
+    <div class="prog-bar" style="margin-bottom:10px"><div class="prog-fill" style="width:${Math.round(doneCheck/checkItems.length*100)}%;background:var(--sage)"></div></div>
+    <div class="checklist-grid">
+      ${checkItems.map((item,i)=>`
+        <label class="check-item">
+          <input type="checkbox" ${checklist[i]?"checked":""} onchange="toggleCheck('${ev.id}',${i},this.checked)">
+          <span style="${checklist[i]?"text-decoration:line-through;color:var(--muted)":""}">${item}</span>
+        </label>`).join("")}
+    </div>
+
+    <h3 class="section-title" style="margin-top:20px">📝 Notes</h3>
+    <textarea class="notes-area" id="notesArea" onblur="saveNotes('${ev.id}')">${ev.notes||""}</textarea>
+
+    <h3 class="section-title" style="margin-top:16px">Activity Log</h3>
+    <div class="log-wrap">
+      ${[...(ev.log||[])].reverse().map(l=>`<div class="log-row">
+        <span style="color:var(--rose)">•</span>
+        <span style="font-weight:500;color:var(--ink);font-size:11px">${new Date(l.ts).toLocaleString("en-IN",{day:"numeric",month:"short",hour:"2-digit",minute:"2-digit"})}</span>
+        <span style="font-size:12px;color:var(--muted)">${l.msg}</span>
+      </div>`).join("")}
+    </div>
+  </div>`;
+}
+
+window.doAdvance = async id => { const ev=events.find(e=>e.id===id); if(ev) await advanceStage(ev); };
+window.confirmDelete = async id => { if(confirm("Delete this event?")){ await deleteEvent(id); selectedEventId=null; renderView(); toast("Deleted"); }};
+window.toggleCheck = async (id,i,val) => { const ev=events.find(e=>e.id===id); if(!ev) return; const c={...ev.checklist||{}}; c[i]=val; await updateEvent(id,{checklist:c}); };
+window.saveNotes = async id => { const el=$("notesArea"); if(el) await updateEvent(id,{notes:el.value}); };
+window.sendFollowup = async id => {
+  const ev=events.find(e=>e.id===id); if(!ev) return;
+  const count=(ev.followupCount||0)+1;
+  await updateEvent(id,{followupCount:count});
+  await logAction(ev,`Follow-up ${count} generated`);
+  showMsgModal(id,`followup${count}`);
+};
+window.autoSelect = async id => {
+  const ev=events.find(e=>e.id===id); if(!ev) return;
+  await logAction(ev,"Auto-selected photos");
+  await advanceStage(ev);
+  toast("Proceeding with professional selection");
+};
+
+// ── MSG MODAL ─────────────────────────────────────────────────
+window.showMsgModal = (id, type) => {
+  const ev=events.find(e=>e.id===id); if(!ev) return;
+  const text=msgs[type]?msgs[type](ev):"";
+  const labels={bookingConfirm:"Booking Confirmation",galleryLink:"Gallery Link",followup1:"Follow-up 1",followup2:"Follow-up 2",followup3:"Follow-up 3",finalDelivery:"Final Delivery",paymentReminder:"Payment Reminder",reviewRequest:"Review Request"};
+  $("modal").innerHTML=`
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+      <h3 style="font-family:'Playfair Display',serif;font-size:18px">${labels[type]||type}</h3>
+      <button onclick="closeModal()" style="background:none;border:none;font-size:18px;cursor:pointer;color:var(--muted)">✕</button>
+    </div>
+    <p style="font-size:12px;color:var(--muted);margin-bottom:12px">For: ${ev.client} · ${ev.type}</p>
+    <textarea id="msgText" style="width:100%;padding:14px;border:1px solid var(--border);border-radius:8px;font-size:13px;line-height:1.7;height:240px;resize:vertical;background:var(--bg);color:var(--ink);box-sizing:border-box;outline:none">${text}</textarea>
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px;flex-wrap:wrap">
+      <button class="btn-outline" onclick="copyMsg()">📋 Copy</button>
+      ${ev.phone?`<a href="${waLink(ev.phone,text)}" target="_blank" class="btn-wa" id="waBtn">💬 WhatsApp</a>`:""}
+      <button class="btn-next" onclick="markSent('${id}','${labels[type]||type}')">✓ Mark Sent</button>
+    </div>`;
+  $("modalOverlay").style.display="flex";
+  // Update WA link when text edited
+  $("msgText").addEventListener("input",e=>{
+    const wb=$("waBtn"); if(wb) wb.href=waLink(ev.phone,e.target.value);
+  });
+};
+window.closeModal = () => $("modalOverlay").style.display="none";
+window.copyMsg = () => { navigator.clipboard.writeText($("msgText").value); toast("Copied!"); };
+window.markSent = async (id,label) => {
+  const ev=events.find(e=>e.id===id); if(ev) await logAction(ev,`Message sent: ${label}`);
+  closeModal(); toast("Marked as sent ✓");
+};
+
+// ── EDIT EVENT MODAL ──────────────────────────────────────────
+window.openEditEvent = id => {
+  const ev=events.find(e=>e.id===id); if(!ev) return;
+  const staff=studioProfile?.staff||[];
+  $("modal").innerHTML=`
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+      <h3 style="font-family:'Playfair Display',serif;font-size:18px">Edit Event</h3>
+      <button onclick="closeModal()" style="background:none;border:none;font-size:18px;cursor:pointer">✕</button>
+    </div>
+    <div class="edit-grid">
+      <div class="fg"><label>CLIENT NAME</label><input id="ed_client" value="${ev.client||""}"></div>
+      <div class="fg"><label>DATE</label><input type="date" id="ed_date" value="${ev.date||""}"></div>
+      <div class="fg"><label>TYPE</label><input id="ed_type" value="${ev.type||""}"></div>
+      <div class="fg"><label>PHONE</label><input id="ed_phone" value="${ev.phone||""}"></div>
+      <div class="fg"><label>EMAIL</label><input type="email" id="ed_email" value="${ev.email||""}"></div>
+      <div class="fg"><label>VENUE</label><input id="ed_venue" value="${ev.venue||""}"></div>
+      <div class="fg"><label>TOTAL (₹)</label><input type="number" id="ed_total" value="${ev.amountTotal||""}"></div>
+      <div class="fg"><label>PAID (₹)</label><input type="number" id="ed_paid" value="${ev.amountPaid||""}"></div>
+      <div class="fg" style="grid-column:1/-1"><label>GALLERY LINK</label><input id="ed_gallery" value="${ev.galleryLink||""}"></div>
+      <div class="fg" style="grid-column:1/-1"><label>FINAL LINK</label><input id="ed_final" value="${ev.finalLink||""}"></div>
+    </div>
+    ${staff.length>0?`<div class="fg"><label>STAFF</label><div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:4px">
+      ${staff.map(s=>`<label style="display:flex;align-items:center;gap:4px;font-size:12px;cursor:pointer"><input type="checkbox" value="${s}" ${(ev.staff||[]).includes(s)?"checked":""}> ${s}</label>`).join("")}
+    </div></div>`:""}
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">
+      <button class="btn-outline" onclick="closeModal()">Cancel</button>
+      <button class="btn-next" onclick="saveEdit('${id}')">Save Changes</button>
+    </div>`;
+  $("modalOverlay").style.display="flex";
+};
+
+window.saveEdit = async id => {
+  const staff=[...document.querySelectorAll('#modal input[type=checkbox]:checked')].map(c=>c.value);
+  await updateEvent(id,{
+    client:$("ed_client").value, date:$("ed_date").value, type:$("ed_type").value,
+    phone:$("ed_phone").value, email:$("ed_email").value, venue:$("ed_venue").value,
+    amountTotal:Number($("ed_total").value)||0, amountPaid:Number($("ed_paid").value)||0,
+    galleryLink:$("ed_gallery").value, finalLink:$("ed_final").value, staff
+  });
+  closeModal(); toast("Event updated ✓");
+};
+
+// ── INVOICE ───────────────────────────────────────────────────
+window.generateInvoice = id => {
+  const ev=events.find(e=>e.id===id); if(!ev) return;
+  const due=(ev.amountTotal||0)-(ev.amountPaid||0);
+  const inv=`INV-${id.slice(-6).toUpperCase()}`;
+  const html=`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Invoice</title>
+  <style>body{font-family:'Inter',sans-serif;margin:0;padding:40px;background:#fff;color:#1a1410}
+  .header{background:#1a1410;color:#faf7f2;padding:28px 32px;border-radius:12px;margin-bottom:28px;display:flex;justify-content:space-between}
+  .brand{font-family:Georgia,serif;font-size:24px;font-weight:700}.studio-sub{color:#c9a84c;font-size:12px;margin-top:4px}
+  .inv-no{text-align:right}.inv-label{font-size:22px;font-weight:700;color:#c9a84c}.inv-num{font-size:12px;color:#a09080;margin-top:4px}
+  .two{display:grid;grid-template-columns:1fr 1fr;gap:24px;margin-bottom:28px}
+  .section-label{font-size:10px;font-weight:700;color:#8a7e75;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:8px}
+  .client-name{font-size:20px;font-weight:700;margin-bottom:4px}.meta{font-size:13px;color:#6b5c50;margin-bottom:2px}
+  .detail-row{display:flex;justify-content:space-between;margin-bottom:6px;font-size:13px}
+  .detail-label{color:#8a7e75}.table{width:100%;border-collapse:collapse;margin-bottom:24px}
+  .table th{background:#1a1410;color:#c9a84c;padding:10px 14px;text-align:left;font-size:11px}
+  .table td{padding:12px 14px;border-bottom:1px solid #f0e8e0;font-size:13px}
+  .totals{background:#faf7f2;border-radius:10px;padding:20px;max-width:280px;margin-left:auto}
+  .total-row{display:flex;justify-content:space-between;margin-bottom:8px;font-size:13px}
+  .total-row.due{background:#c4715a;color:#fff;padding:10px 14px;border-radius:8px;font-weight:700;font-size:15px}
+  .footer{background:#1a1410;color:#c9a84c;text-align:center;padding:16px;border-radius:10px;margin-top:28px;font-size:13px}
+  @media print{body{padding:0}}</style></head><body>
+  <div class="header">
+    <div><div class="brand">📷 ${sName()}</div><div class="studio-sub">Wedding Photography & Videography</div>${studioProfile?.phone?`<div style="color:#a09080;font-size:11px;margin-top:4px">${studioProfile.phone}</div>`:""}</div>
+    <div class="inv-no"><div class="inv-label">INVOICE</div><div class="inv-num">${inv}</div><div class="inv-num">${new Date().toLocaleDateString("en-IN",{day:"numeric",month:"long",year:"numeric"})}</div></div>
+  </div>
+  <div class="two">
+    <div><div class="section-label">Bill To</div><div class="client-name">${ev.client}</div>${ev.phone?`<div class="meta">📱 ${ev.phone}</div>`:""}${ev.email?`<div class="meta">✉ ${ev.email}</div>`:""}</div>
+    <div><div class="section-label">Event Details</div>
+      <div class="detail-row"><span class="detail-label">Event</span><span>${ev.type}</span></div>
+      <div class="detail-row"><span class="detail-label">Date</span><span>${fmtDate(ev.date)}</span></div>
+      ${ev.venue?`<div class="detail-row"><span class="detail-label">Venue</span><span>${ev.venue}</span></div>`:""}
+    </div>
+  </div>
+  <table class="table"><tr><th>#</th><th>Description</th><th style="text-align:right">Amount</th></tr>
+  <tr><td>1</td><td>${ev.notes||ev.type+" Package"}</td><td style="text-align:right">${fmtCur(ev.amountTotal)}</td></tr></table>
+  <div class="totals">
+    <div class="total-row"><span>Total</span><span>${fmtCur(ev.amountTotal)}</span></div>
+    <div class="total-row"><span>Amount Paid</span><span>${fmtCur(ev.amountPaid)}</span></div>
+    <div class="total-row due"><span>Balance Due</span><span>${fmtCur(due)}</span></div>
+    ${studioProfile?.upiId?`<div style="margin-top:12px;font-size:12px;color:#8a7e75">UPI: ${studioProfile.upiId}</div>`:""}
+  </div>
+  <div class="footer">Thank you for choosing us to capture your special day 📷 · ${sName()}</div>
+  <script>window.print();<\/script></body></html>`;
+  const w=window.open("","_blank"); w.document.write(html); w.document.close();
+};
+
+// ── CALENDAR ──────────────────────────────────────────────────
+function renderCalendar() {
+  if(!window._calMonth) window._calMonth=new Date();
+  const m=window._calMonth;
+  const y=m.getFullYear(), mo=m.getMonth();
+  const first=new Date(y,mo,1), last=new Date(y,mo+1,0);
+  const days=[]; for(let d=1;d<=last.getDate();d++) days.push(new Date(y,mo,d));
+  const startDow=first.getDay();
+  const eventMap={};
+  events.forEach(ev=>{if(!ev.date)return; const k=ev.date; if(!eventMap[k])eventMap[k]=[]; eventMap[k].push(ev);});
+  const stageCols=["#8b7db5","#c9a84c","#5a9ec4","#c4715a","#e07060","#c4715a","#7a9e87","#1a1410"];
+  const monthName=m.toLocaleDateString("en-IN",{month:"long",year:"numeric"});
+  return `<div class="page">
+    <div style="display:flex;align-items:center;gap:16px;margin-bottom:20px">
+      <button class="btn-outline" onclick="calNav(-1)">‹</button>
+      <h2 style="font-family:'Playfair Display',serif;font-size:22px;flex:1;text-align:center;margin:0">${monthName}</h2>
+      <button class="btn-outline" onclick="calNav(1)">›</button>
+    </div>
+    <div class="cal-grid">
+      ${["Sun","Mon","Tue","Wed","Thu","Fri","Sat"].map(d=>`<div class="cal-dow">${d}</div>`).join("")}
+      ${Array(startDow).fill('<div></div>').join("")}
+      ${days.map(day=>{
+        const k=`${y}-${String(mo+1).padStart(2,"0")}-${String(day.getDate()).padStart(2,"0")}`;
+        const dayEvs=eventMap[k]||[];
+        const isToday=k===new Date().toISOString().slice(0,10);
+        return `<div class="cal-day ${isToday?"today":""}">
+          <div class="cal-num ${isToday?"today-num":""}">${day.getDate()}</div>
+          ${dayEvs.slice(0,3).map(ev=>`<div class="cal-chip" style="background:${stageCols[ev.stage]}" onclick="selectEvent('${ev.id}')" title="${ev.client}">${ev.client.split(" ")[0]}</div>`).join("")}
+          ${dayEvs.length>3?`<div style="font-size:9px;color:var(--muted)">+${dayEvs.length-3}</div>`:""}
+        </div>`;
+      }).join("")}
+    </div>
+  </div>`;
+}
+window.calNav = dir => { const m=window._calMonth||new Date(); window._calMonth=new Date(m.getFullYear(),m.getMonth()+dir,1); renderView(); };
+
+// ── LEADS ─────────────────────────────────────────────────────
+const LEAD_STATUSES=["New","Contacted","Quoted","Negotiating","Won","Lost"];
+const LEAD_COLORS={New:["#e8f4fd","#1a6a8a"],Contacted:["#fdf3d4","#8a7010"],Quoted:["#fde9d4","#a05a1a"],Negotiating:["#e8e0f8","#5a3a8a"],Won:["#e4efe7","#2a6a3a"],Lost:["#f5e8e8","#8a2a2a"]};
+
+function renderLeads() {
+  return `<div class="page">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px">
+      <div><h2 class="heading">Leads & Enquiries</h2><p class="sub-text">${leads.length} total · ${leads.filter(l=>l.status==="Won").length} converted</p></div>
+      <button class="btn-primary" onclick="toggleLeadForm()">＋ New Lead</button>
+    </div>
+    <div id="leadFormWrap" style="display:none">
+      <div class="card" style="margin-bottom:20px">
+        <h3 style="font-family:'Playfair Display',serif;font-size:15px;margin-bottom:14px">New Enquiry</h3>
+        <div class="edit-grid">
+          <div class="fg"><label>NAME *</label><input id="lf_name" placeholder="Client name"></div>
+          <div class="fg"><label>PHONE</label><input id="lf_phone" placeholder="+91..."></div>
+          <div class="fg"><label>EMAIL</label><input type="email" id="lf_email"></div>
+          <div class="fg"><label>EVENT TYPE</label><select id="lf_type">${["Wedding","Engagement","Reception","Pre-Wedding Shoot","Birthday","Other"].map(t=>`<option>${t}</option>`).join("")}</select></div>
+          <div class="fg"><label>EVENT DATE</label><input type="date" id="lf_date"></div>
+          <div class="fg"><label>BUDGET (₹)</label><input type="number" id="lf_budget"></div>
+          <div class="fg"><label>SOURCE</label><select id="lf_source">${["Instagram","Facebook","WhatsApp","Referral","Google","Website","Walk-in","Other"].map(s=>`<option>${s}</option>`).join("")}</select></div>
+          <div class="fg"><label>VENUE</label><input id="lf_venue"></div>
+          <div class="fg" style="grid-column:1/-1"><label>NOTES</label><textarea id="lf_notes" style="height:50px"></textarea></div>
+        </div>
+        <div style="display:flex;gap:8px;margin-top:8px">
+          <button class="btn-primary" onclick="submitLead()">Save Lead</button>
+          <button class="btn-outline" onclick="toggleLeadForm()">Cancel</button>
+        </div>
+      </div>
+    </div>
+    <div class="kanban">
+      ${LEAD_STATUSES.map(status=>{
+        const [bg,col]=LEAD_COLORS[status];
+        const items=leads.filter(l=>l.status===status);
+        return `<div class="kanban-col">
+          <div class="kanban-header" style="background:${bg};color:${col}">${status} <span class="badge" style="background:rgba(0,0,0,0.1);color:inherit">${items.length}</span></div>
+          ${items.map(l=>`<div class="lead-card" onclick="openLeadDetail('${l.id}')">
+            <div style="font-weight:600;font-size:13px;margin-bottom:2px">${l.name}</div>
+            <div style="font-size:11px;color:var(--muted)">${l.eventType||""} ${l.eventDate?`· ${fmtDate(l.eventDate)}`:""}</div>
+            ${l.phone?`<div style="font-size:11px;color:var(--muted)">📱 ${l.phone}</div>`:""}
+            ${l.budget?`<div style="font-size:11px;color:var(--muted)">💰 ₹${Number(l.budget).toLocaleString("en-IN")}</div>`:""}
+            <div class="source-pill">${l.source||""}</div>
+          </div>`).join("")}
+        </div>`;
+      }).join("")}
+    </div>
+  </div>`;
+}
+
+window.toggleLeadForm = () => { const f=$("leadFormWrap"); if(f) f.style.display=f.style.display==="none"?"block":"none"; };
+window.submitLead = async () => {
+  const name=$("lf_name")?.value.trim(); if(!name){toast("Name required");return;}
+  await addLead({name,phone:$("lf_phone").value,email:$("lf_email").value,eventType:$("lf_type").value,eventDate:$("lf_date").value,budget:$("lf_budget").value,source:$("lf_source").value,venue:$("lf_venue").value,notes:$("lf_notes").value});
+  toast("Lead added!"); renderView();
+};
+window.openLeadDetail = id => {
+  const l=leads.find(x=>x.id===id); if(!l) return;
+  $("modal").innerHTML=`
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+      <h3 style="font-family:'Playfair Display',serif;font-size:18px">${l.name}</h3>
+      <button onclick="closeModal()" style="background:none;border:none;font-size:18px;cursor:pointer">✕</button>
+    </div>
+    ${[["Event",`${l.eventType||""} ${l.eventDate?`· ${fmtDate(l.eventDate)}`:""}`],["Phone",l.phone],["Email",l.email],["Budget",l.budget?`₹${Number(l.budget).toLocaleString("en-IN")}`:null],["Source",l.source],["Venue",l.venue],["Notes",l.notes]].filter(r=>r[1]).map(r=>`<div style="margin-bottom:8px"><div style="font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase">${r[0]}</div><div style="font-size:13px">${r[1]}</div></div>`).join("")}
+    <div class="fg" style="margin-top:12px"><label>STATUS</label>
+      <select id="lead_status" onchange="updateLeadStatus('${id}',this.value)">
+        ${LEAD_STATUSES.map(s=>`<option ${l.status===s?"selected":""}>${s}</option>`).join("")}
+      </select>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:8px;margin-top:16px">
+      ${l.phone?`<a href="${waLink(l.phone,`Hi ${firstName(l.name)}! This is regarding your ${l.eventType||"photography"} enquiry with ${sName()}.`)}" target="_blank" class="btn-wa" style="text-align:center;text-decoration:none">💬 WhatsApp</a>`:""}
+      <button class="btn-next" onclick="convertLeadToBooking('${id}')">🎉 Convert to Booking</button>
+      <button class="btn-outline" style="color:var(--rose)" onclick="confirmDeleteLead('${id}')">🗑 Delete Lead</button>
+    </div>`;
+  $("modalOverlay").style.display="flex";
+};
+window.updateLeadStatus = async (id,status) => { await updateLead(id,{status}); toast(`Status → ${status}`); };
+window.confirmDeleteLead = async id => { if(confirm("Delete lead?")){ await deleteLead(id); closeModal(); toast("Deleted"); }};
+window.convertLeadToBooking = id => {
+  const l=leads.find(x=>x.id===id); if(!l) return;
+  window._prefillBooking={client:l.name,phone:l.phone,email:l.email,type:l.eventType,date:l.eventDate,venue:l.venue,notes:l.notes};
+  closeModal(); currentView="events"; selectedEventId=null; renderView();
+  setTimeout(()=>{ $("bookingForm").style.display="block"; $("bf_client").value=l.name||""; $("bf_phone").value=l.phone||""; $("bf_email").value=l.email||""; $("bf_date").value=l.eventDate||""; $("bf_venue").value=l.venue||""; $("bf_notes").value=l.notes||""; },100);
+  toast("Fill in the booking form!");
+};
+
+// ── SETTINGS ──────────────────────────────────────────────────
+function renderSettings() {
+  const stages=getStages();
+  const staff=studioProfile?.staff||[];
+  const pkgs=studioProfile?.packages||[];
+  return `<div class="page" style="max-width:720px">
+    <h2 class="heading">Settings</h2>
+
+    <div class="card" style="margin-bottom:16px">
+      <h3 class="card-title">Studio Profile</h3>
+      <div class="edit-grid">
+        <div class="fg"><label>STUDIO NAME</label><input id="s_studio" value="${studioProfile?.studioName||""}"></div>
+        <div class="fg"><label>OWNER NAME</label><input id="s_owner" value="${studioProfile?.ownerName||""}"></div>
+        <div class="fg"><label>PHONE</label><input id="s_phone" value="${studioProfile?.phone||""}"></div>
+        <div class="fg"><label>UPI ID</label><input id="s_upi" value="${studioProfile?.upiId||""}"></div>
+        <div class="fg"><label>GOOGLE REVIEW LINK</label><input id="s_review" value="${studioProfile?.googleReviewLink||""}"></div>
+        <div class="fg"><label>INSTAGRAM</label><input id="s_insta" value="${studioProfile?.instagramHandle||""}" placeholder="@yourstudio"></div>
+      </div>
+      <button class="btn-primary" onclick="saveProfile()">Save Profile</button>
+    </div>
+
+    <div class="card" style="margin-bottom:16px">
+      <h3 class="card-title">Workflow Stages <span style="font-size:11px;color:var(--muted);font-weight:400">(Admin can add/remove steps)</span></h3>
+      <div id="stagesList">
+        ${stages.map((s,i)=>`<div class="stage-edit-row" id="sr_${i}">
+          <span style="font-size:16px">${s.icon}</span>
+          <input value="${s.name}" id="sn_${i}" style="flex:1;padding:6px 8px;border:1px solid var(--border);border-radius:6px;font-size:13px;background:var(--bg);color:var(--ink)">
+          <input type="number" value="${s.sla||""}" id="ss_${i}" placeholder="SLA days" style="width:80px;padding:6px 8px;border:1px solid var(--border);border-radius:6px;font-size:12px;background:var(--bg);color:var(--ink)">
+          ${i>0&&i<stages.length-1?`<button onclick="removeStage(${i})" style="background:none;border:none;color:var(--rose);cursor:pointer;font-size:14px">✕</button>`:'<div style="width:20px"></div>'}
+        </div>`).join("")}
+      </div>
+      <div style="display:flex;gap:8px;margin-top:10px">
+        <button class="btn-outline" onclick="addCustomStage()">＋ Add Stage</button>
+        <button class="btn-primary" onclick="saveStages()">Save Stages</button>
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom:16px">
+      <h3 class="card-title">Packages</h3>
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px;margin-bottom:14px">
+        ${pkgs.map(p=>`<div style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:12px">
+          <div style="font-family:'Playfair Display',serif;font-size:14px;font-weight:700">${p.name}</div>
+          <div style="font-size:16px;font-weight:700;color:var(--rose);margin:4px 0">${fmtCur(p.price)}</div>
+          ${p.includes?`<div style="font-size:11px;color:var(--sage)">${p.includes}</div>`:""}
+          <button onclick="removePkg(${p.id})" style="background:none;border:none;color:var(--rose);font-size:11px;cursor:pointer;margin-top:6px">✕ Remove</button>
+        </div>`).join("")}
+      </div>
+      <div class="edit-grid" style="margin-bottom:10px">
+        <div class="fg"><label>NAME</label><input id="pk_name" placeholder="e.g. Gold"></div>
+        <div class="fg"><label>PRICE (₹)</label><input type="number" id="pk_price" placeholder="50000"></div>
+        <div class="fg" style="grid-column:1/-1"><label>INCLUDES (comma separated)</label><input id="pk_includes" placeholder="2 photographers, full day, drone, reels"></div>
+      </div>
+      <button class="btn-primary" onclick="addPkg()">＋ Add Package</button>
+    </div>
+
+    <div class="card" style="margin-bottom:16px">
+      <h3 class="card-title">Staff / Team</h3>
+      ${staff.map(s=>`<div style="display:flex;justify-content:space-between;align-items:center;padding:8px;background:var(--bg);border-radius:6px;margin-bottom:6px;font-size:13px">👤 ${s}<button onclick="removeStaff('${s}')" style="background:none;border:none;color:var(--rose);cursor:pointer">✕</button></div>`).join("")}
+      <div style="display:flex;gap:8px;margin-top:8px">
+        <input id="s_staffName" placeholder="Name" style="flex:1;padding:8px;border:1px solid var(--border);border-radius:6px;font-size:13px;background:var(--bg);color:var(--ink)">
+        <select id="s_staffRole" style="padding:8px;border:1px solid var(--border);border-radius:6px;font-size:13px;background:var(--bg);color:var(--ink)">
+          ${["Lead Photographer","Second Photographer","Videographer","Editor","Assistant"].map(r=>`<option>${r}</option>`).join("")}
+        </select>
+        <button class="btn-primary" onclick="addStaff()">Add</button>
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom:16px">
+      <h3 class="card-title">Account</h3>
+      <p style="font-size:13px;color:var(--muted)">Signed in as: <b>${studioProfile?.email||currentUser?.email}</b></p>
+      <button class="btn-outline" style="margin-top:12px;color:var(--rose)" onclick="doLogout()">Sign Out</button>
+    </div>
+  </div>`;
+}
+
+window.saveProfile = async () => {
+  await saveStudioProfile({studioName:$("s_studio").value,ownerName:$("s_owner").value,phone:$("s_phone").value,upiId:$("s_upi").value,googleReviewLink:$("s_review").value,instagramHandle:$("s_insta").value});
+  toast("Profile saved!");
+};
+
+window.addCustomStage = () => {
+  const stages=getStages();
+  const newStage={id:stages.length,name:"New Stage",icon:"📌",sla:null};
+  const updated=[...stages.slice(0,-1),newStage,stages[stages.length-1]];
+  studioProfile={...studioProfile,customStages:updated};
+  renderView();
+};
+
+window.removeStage = async i => {
+  const stages=getStages().filter((_,idx)=>idx!==i).map((s,idx)=>({...s,id:idx}));
+  await saveStudioProfile({customStages:stages});
+  renderView(); toast("Stage removed");
+};
+
+window.saveStages = async () => {
+  const stages=getStages().map((s,i)=>({...s,name:$(`sn_${i}`)?.value||s.name,sla:Number($(`ss_${i}`)?.value)||null}));
+  await saveStudioProfile({customStages:stages});
+  toast("Stages saved!");
+};
+
+window.addPkg = async () => {
+  const name=$("pk_name").value.trim(); if(!name){toast("Name required");return;}
+  const pkg={id:Date.now(),name,price:Number($("pk_price").value)||0,includes:$("pk_includes").value};
+  await saveStudioProfile({packages:[...(studioProfile?.packages||[]),pkg]});
+  toast("Package added!"); renderView();
+};
+window.removePkg = async id => {
+  await saveStudioProfile({packages:(studioProfile?.packages||[]).filter(p=>p.id!=id)});
+  toast("Removed"); renderView();
+};
+window.addStaff = async () => {
+  const name=$("s_staffName").value.trim(); if(!name) return;
+  const entry=`${name} (${$("s_staffRole").value})`;
+  await saveStudioProfile({staff:[...(studioProfile?.staff||[]),entry]});
+  toast("Staff added"); renderView();
+};
+window.removeStaff = async name => {
+  await saveStudioProfile({staff:(studioProfile?.staff||[]).filter(s=>s!==name)});
+  renderView();
+};
+
+// ── EXCEL EXPORT ──────────────────────────────────────────────
+window.exportExcel = () => {
+  const rows=events.map((ev,i)=>({
+    "#":i+1,"Client":ev.client,"Type":ev.type,"Date":fmtDate(ev.date),"Venue":ev.venue||"","Phone":ev.phone||"","Email":ev.email||"",
+    "Stage":getStages()[ev.stage]?.name||"","Total":ev.amountTotal||0,"Paid":ev.amountPaid||0,"Due":(ev.amountTotal||0)-(ev.amountPaid||0),
+    "Staff":(ev.staff||[]).join(", "),"Follow-ups":ev.followupCount||0,"Gallery":ev.galleryLink||"","Final":ev.finalLink||""
+  }));
+  const headers=Object.keys(rows[0]||{});
+  const csv=[headers.join(","),...rows.map(r=>headers.map(h=>`"${String(r[h]||"").replace(/"/g,'""')}"`).join(","))].join("\n");
+  const a=document.createElement("a"); a.href="data:text/csv;charset=utf-8,"+encodeURIComponent(csv);
+  a.download=`FramedForever_Events_${new Date().toISOString().slice(0,10)}.csv`; a.click();
+  toast("Exported!");
+};
+
+// ── ATTACH LISTENERS ──────────────────────────────────────────
+function attachEventListeners() {}
+
+</script>
+
+<style>
+:root {
+  --bg:#faf7f2;--surface:#fff;--border:#e5ddd5;--ink:#1a1410;--muted:#8a7e75;
+  --rose:#c4715a;--rose-light:#fde9d4;--sage:#7a9e87;--sage-light:#e4efe7;
+  --gold:#c9a84c;--nav:#1a1410;
+}
+.dark {
+  --bg:#0f0d0b;--surface:#1c1814;--border:#2e2820;--ink:#f0ebe4;--muted:#7a6e65;
+  --rose:#d4836a;--rose-light:#2a1a14;--sage:#8ab09a;--sage-light:#1a2e20;--gold:#d4b86a;--nav:#0a0806;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--ink);-webkit-font-smoothing:antialiased}
+.app{min-height:100vh;display:flex;flex-direction:column}
+.nav{background:var(--nav);display:flex;align-items:center;padding:0 16px;height:52px;gap:12px;flex-shrink:0}
+.nav-brand{display:flex;align-items:center;gap:8px}
+.nav-title{font-family:'Playfair Display',serif;font-size:16px;font-weight:700;color:#faf7f2;white-space:nowrap}
+.nav-studio{font-size:10px;color:var(--gold);background:rgba(201,168,76,0.15);padding:2px 8px;border-radius:20px}
+.nav-links{display:flex;gap:2px;flex:1;overflow-x:auto}
+.nav-btn{padding:5px 10px;background:transparent;border:none;border-radius:6px;color:#a09080;cursor:pointer;font-size:12px;font-weight:500;white-space:nowrap}
+.nav-btn.active{background:rgba(196,113,90,0.2);color:var(--rose)}
+.nav-right{display:flex;align-items:center;gap:6px;margin-left:auto}
+.od-badge{background:var(--rose);color:#fff;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:700;cursor:pointer}
+.icon-btn{background:transparent;border:none;cursor:pointer;font-size:15px;padding:4px;color:#a09080}
+.body{flex:1;overflow:hidden;display:flex;flex-direction:column}
+
+/* Auth */
+.auth-page{min-height:100vh;background:linear-gradient(135deg,#1a1410,#2d2218);display:flex;align-items:center;justify-content:center;padding:20px}
+.auth-card{background:#faf7f2;border-radius:16px;padding:36px;width:100%;max-width:400px;text-align:center}
+.auth-logo{font-size:44px;margin-bottom:8px}
+.auth-brand{font-family:'Playfair Display',serif;font-size:26px;color:#1a1410}
+.auth-sub{font-size:13px;color:#8a7e75;margin:4px 0 24px}
+.auth-tabs{display:flex;background:#f0e8e0;border-radius:8px;padding:3px;margin-bottom:20px}
+.auth-tab{flex:1;padding:8px;border:none;border-radius:6px;background:transparent;cursor:pointer;font-size:13px;font-weight:500;color:#8a7e75}
+.auth-tab.active{background:#fff;color:#1a1410;font-weight:600;box-shadow:0 1px 4px rgba(0,0,0,0.1)}
+.auth-btn{width:100%;padding:12px;background:#c4715a;color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;margin-top:8px}
+.fg{margin-bottom:12px;text-align:left}
+.fg label{display:block;font-size:10px;font-weight:700;color:#8a7e75;text-transform:uppercase;letter-spacing:.5px;margin-bottom:3px}
+.fg input,.fg select,.fg textarea{width:100%;padding:9px 11px;border:1px solid var(--border);border-radius:7px;font-size:13px;background:var(--surface);color:var(--ink);outline:none;font-family:'Inter',sans-serif}
+.fg textarea{resize:vertical;height:60px}
+
+/* Layout */
+.page{padding:24px 28px;overflow-y:auto;flex:1}
+.heading{font-family:'Playfair Display',serif;font-size:24px;font-weight:700;margin-bottom:4px}
+.sub-text{font-size:12px;color:var(--muted);margin-bottom:20px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:18px 20px;margin-bottom:16px}
+.card-title{font-family:'Playfair Display',serif;font-size:15px;font-weight:600;margin-bottom:14px}
+.two-col{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:16px}
+.list-row{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--border);cursor:pointer}
+.kpi-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:10px;margin-bottom:20px}
+.kpi-card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:14px;text-align:center}
+.badge{display:inline-block;padding:2px 8px;border-radius:20px;font-size:10px;font-weight:600}
+
+/* Events */
+.events-layout{display:flex;flex:1;overflow:hidden}
+.sidebar{width:260px;background:var(--surface);border-right:1px solid var(--border);display:flex;flex-direction:column;flex-shrink:0}
+.event-list{flex:1;overflow-y:auto}
+.event-item{padding:12px 14px;border-bottom:1px solid var(--border);cursor:pointer;position:relative}
+.event-item.active{background:var(--rose-light);border-left:3px solid var(--rose)}
+.stage-badge{display:inline-block;margin-top:5px;padding:2px 8px;border-radius:20px;font-size:10px;font-weight:600;background:#e8e0d8;color:#6b5c50}
+.stage-badge.stage-7{background:#1a1410;color:#faf7f2}
+.od-dot{position:absolute;top:12px;right:12px;width:7px;height:7px;border-radius:50%;background:var(--rose)}
+.filter-btn{padding:3px 10px;border:1px solid var(--border);border-radius:20px;font-size:11px;cursor:pointer;background:var(--surface);color:var(--muted)}
+.filter-btn.active{background:var(--ink);color:#faf7f2;border-color:var(--ink)}
+.detail-panel{flex:1;overflow-y:auto}
+.empty-state{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;color:var(--muted);text-align:center}
+
+/* Detail */
+.detail-header{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:18px;padding-bottom:16px;border-bottom:1px solid var(--border)}
+.prog-bar{height:6px;background:var(--border);border-radius:3px;overflow:hidden;margin-bottom:16px}
+.prog-fill{height:100%;background:linear-gradient(90deg,var(--rose),var(--gold));border-radius:3px;transition:width .4s}
+.info-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:18px}
+.info-card{background:var(--surface);border:1px solid var(--border);border-radius:9px;padding:12px}
+.info-label{font-size:10px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:3px}
+.info-val{font-size:14px;font-weight:700}
+.link-btn{padding:6px 12px;background:var(--rose-light);color:var(--rose);border-radius:7px;text-decoration:none;font-size:12px;font-weight:500}
+.section-title{font-family:'Playfair Display',serif;font-size:14px;font-weight:600;margin-bottom:12px}
+
+/* Timeline */
+.timeline{margin-bottom:20px}
+.tl-row{display:flex;gap:10px;margin-bottom:4px}
+.tl-dot-wrap{display:flex;flex-direction:column;align-items:center;width:26px;flex-shrink:0;padding-top:14px}
+.tl-dot{width:16px;height:16px;border-radius:50%;border:2px solid var(--border);background:var(--surface);display:flex;align-items:center;justify-content:center;font-size:8px;z-index:1;flex-shrink:0}
+.tl-dot.done{background:var(--sage);border-color:var(--sage);color:#fff}
+.tl-dot.active{background:var(--rose);border-color:var(--rose);color:#fff;box-shadow:0 0 0 4px rgba(196,113,90,.15)}
+.tl-line{width:2px;flex:1;background:var(--border);min-height:10px}
+.tl-line.done{background:var(--sage)}
+.step-card{flex:1;background:var(--surface);border:1px solid var(--border);border-radius:9px;padding:12px 14px;margin-bottom:8px}
+.step-card.active{border-color:var(--rose);box-shadow:0 0 0 2px rgba(196,113,90,.1)}
+.step-card.done{opacity:.6}
+.step-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
+.step-name{font-weight:600;font-size:13px}
+.sla-tag{font-size:10px;color:var(--muted);background:var(--bg);padding:2px 7px;border-radius:20px}
+.sla-tag.od{color:var(--rose);background:var(--rose-light);font-weight:700}
+.step-actions{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+.btn-msg{padding:6px 12px;background:var(--bg);border:1px solid var(--border);border-radius:6px;cursor:pointer;font-size:11px;font-weight:500;color:var(--ink)}
+.btn-next{padding:7px 14px;background:var(--rose);color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:12px;font-weight:600}
+.btn-gold{padding:7px 14px;background:var(--gold);color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:12px;font-weight:600}
+
+/* Checklist */
+.checklist-grid{display:grid;grid-template-columns:1fr 1fr;gap:4px;margin-bottom:16px}
+.check-item{display:flex;align-items:center;gap:6px;padding:5px;cursor:pointer;font-size:12px;border-radius:5px}
+.check-item:hover{background:var(--bg)}
+.notes-area{width:100%;padding:10px;border:1px solid var(--border);border-radius:8px;font-family:'Inter',sans-serif;font-size:13px;background:var(--surface);color:var(--ink);resize:vertical;height:70px;outline:none}
+.log-wrap{background:var(--surface);border:1px solid var(--border);border-radius:9px;padding:10px 14px}
+.log-row{display:flex;gap:8px;font-size:11px;padding-bottom:5px;margin-bottom:5px;border-bottom:1px solid var(--border)}
+
+/* Buttons */
+.btn-primary{padding:9px 18px;background:var(--rose);color:#fff;border:none;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer}
+.btn-outline{padding:7px 14px;background:var(--surface);border:1px solid var(--border);border-radius:7px;cursor:pointer;font-size:12px;color:var(--ink)}
+.btn-wa{padding:8px 14px;background:#25D366;color:#fff;border-radius:7px;font-size:12px;font-weight:600;text-decoration:none;display:inline-block}
+.w100{width:100%}
+
+/* Calendar */
+.cal-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:2px;background:var(--border);border-radius:10px;overflow:hidden}
+.cal-dow{background:var(--ink);color:var(--gold);text-align:center;padding:7px 0;font-size:10px;font-weight:700}
+.cal-day{background:var(--bg);min-height:80px;padding:5px 6px}
+.cal-day.today{background:var(--rose-light);outline:2px solid var(--rose)}
+.cal-num{font-size:11px;color:var(--muted);margin-bottom:3px}
+.cal-num.today-num{color:var(--rose);font-weight:700}
+.cal-chip{font-size:9px;color:#fff;padding:2px 4px;border-radius:3px;margin-bottom:2px;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* Leads */
+.kanban{display:flex;gap:10px;overflow-x:auto;padding-bottom:12px}
+.kanban-col{min-width:185px;flex:0 0 185px}
+.kanban-header{padding:6px 10px;border-radius:7px 7px 0 0;font-size:11px;font-weight:700;display:flex;justify-content:space-between}
+.lead-card{background:var(--surface);border:1px solid var(--border);border-radius:0 0 7px 7px;padding:9px 10px;margin-bottom:5px;cursor:pointer}
+.source-pill{display:inline-block;background:var(--bg);color:var(--muted);border-radius:20px;padding:1px 7px;font-size:9px;margin-top:3px}
+
+/* Settings */
+.edit-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}
+.stage-edit-row{display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--border)}
+
+/* Modal */
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:200;display:flex;align-items:center;justify-content:center;padding:20px}
+.modal{background:var(--surface);border-radius:14px;padding:24px;width:100%;max-width:540px;max-height:90vh;overflow-y:auto;color:var(--ink)}
+
+/* Toast */
+.toast{position:fixed;bottom:20px;right:20px;background:#1a1410;color:#faf7f2;padding:11px 18px;border-radius:8px;font-size:13px;z-index:300;animation:fadeIn .3s}
+@keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+</style>
+</head>
+<body>
+<div style="display:flex;align-items:center;justify-content:center;height:100vh;font-family:'Inter',sans-serif;color:#8a7e75">Loading...</div>
+</body>
+</html>
